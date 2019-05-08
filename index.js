@@ -5,12 +5,16 @@ const http = require('http');
 const { URL, parse } = require('url');
 const { DEBUG, HEADFUL, CHROME_BIN, PORT } = process.env;
 
-const MAX_REQUESTS = 100;
-const RENDER_TIMEOUT = 10 * 1000;
-const REQUESTS_TIMEOUT = 30;
+const MAX_REQUESTS = parseInt(process.env.MAX_REQUESTS) || 100;
+const RENDER_TIMEOUT = parseInt(process.env.RENDER_TIMEOUT) || 10 * 1000;
+const WAIT_TIMEOUT = parseInt(process.env.WAIT_TIMEOUT) || 15 * 1000;
+const REQUESTS_TIMEOUT = parseInt(process.env.REQUESTS_TIMEOUT) || 30;
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const MAX_CACHE_SIZE = process.env.MAX_CACHE_SIZE || 3000;
 const MAX_CACHE_TTL = process.env.MAX_CACHE_TTL || 3 * 24 * 60 * 60 * 1000; // 3 days
+
+const events = require('events');
+const emitter = new events.EventEmitter();
 
 
 var redis = require('redis');
@@ -32,6 +36,8 @@ const blockedRegExp = new RegExp('(' + blocked.join('|') + ')', 'i');
 const truncate = (str, len) => str.length > len ? str.slice(0, len) + '…' : str;
 
 let browser;
+let currentRunning = new Map();
+
 
 require('http').createServer(async (req, res) => {
 	const { host } = req.headers;
@@ -104,6 +110,32 @@ require('http').createServer(async (req, res) => {
 		let actionDone = false;
 		const width = parseInt(searchParams.get('width'), 10) || 1024;
 		const height = parseInt(searchParams.get('height'), 10) || 768;
+
+		if (currentRunning.has(pageURL)) {
+			const listener = (content) => {
+				if (content) {
+					res.writeHead(200, {
+						'content-type': 'text/html; charset=UTF-8',
+						'cache-control': 'public,max-age=31536000',
+					});
+					res.end(content);
+					console.log(`👻 Page ${pageURL} loaded by another request`);
+				} else {
+					res.writeHead(400, {
+						'content-type': 'text/plain',
+					});
+					res.end('Something is wrong.');
+					console.log(`👻 Page ${pageURL} is failed to load by another request`);
+				}
+			};
+			emitter.on(pageURL, listener);
+			setTimeout(() => {
+				emitter.removeListener(pageURL, listener);
+			}, WAIT_TIMEOUT);
+			return
+		}
+		currentRunning.set(pageURL, 1);
+
 		let cachedContent = await cache.get(pageURL);
 
 		if (!cachedContent) {
@@ -183,6 +215,7 @@ require('http').createServer(async (req, res) => {
 				responsePromise,
 				page.goto(pageURL, {
 					waitUntil: 'networkidle2',
+					timeout: 0,
 				})
 			]);
 
@@ -203,6 +236,8 @@ require('http').createServer(async (req, res) => {
 			});
 			res.end(cachedContent);
 			console.log(`😎 Page ${pageURL} found in cache`);
+			emitter.emit(pageURL, cachedContent);
+			currentRunning.delete(pageURL);
 			return;
 		}
 
@@ -261,6 +296,9 @@ require('http').createServer(async (req, res) => {
 		});
 		res.end(content);
 
+		emitter.emit(pageURL, content);
+		currentRunning.delete(pageURL);
+
 		actionDone = true;
 		console.log('💥 Done render');
 
@@ -279,6 +317,14 @@ require('http').createServer(async (req, res) => {
 				});
 			});
 		}
+		try {
+			if (page && page.close){
+			  console.log('🗑 Disposing ' + url);
+			  page.removeAllListeners();
+			  await page.deleteCookie(await page.cookies());
+			  await page.close();
+			}
+	  } catch (e){}
 	} catch (e) {
 		if (!DEBUG && page) {
 			console.error(e);
@@ -286,6 +332,9 @@ require('http').createServer(async (req, res) => {
 			page.removeAllListeners();
 			page.close();
 		}
+		emitter.emit(pageURL);
+		currentRunning.delete(pageURL);
+
 		await cache.del(pageURL);
 		const { message = '' } = e;
 		res.writeHead(400, {
